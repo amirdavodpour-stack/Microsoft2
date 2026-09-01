@@ -23,6 +23,7 @@ jobs:
     name: Extract ZIP, normalize repository, seed lockfile
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -43,21 +44,113 @@ jobs:
           channel: stable
           cache: true
 
+      # FIX:
+      # Do not depend on ./tools/github/bootstrap_zip.sh.
+      # The previous workflow failed here with exit code 127 because
+      # that file was not available at runtime.
       - name: Extract ZIP into repository root
         shell: bash
         env:
           ARCHIVE_INPUT: ${{ inputs.archive }}
-        run: ./tools/github/bootstrap_zip.sh
+        run: |
+          set -Eeuo pipefail
+
+          cd "$GITHUB_WORKSPACE"
+
+          echo "Workspace: $PWD"
+
+          archive="${ARCHIVE_INPUT:-}"
+
+          if [[ -n "$archive" ]]; then
+            if [[ ! -f "$archive" ]]; then
+              echo "::error::Requested ZIP file does not exist: $archive"
+              exit 1
+            fi
+          else
+            mapfile -t zip_files < <(
+              find "$GITHUB_WORKSPACE" \
+                -maxdepth 1 \
+                -type f \
+                \( -iname '*.zip' \) \
+                -print
+            )
+
+            if [[ ${#zip_files[@]} -eq 0 ]]; then
+              echo "::error::No ZIP file found in repository root."
+              exit 1
+            fi
+
+            if [[ ${#zip_files[@]} -gt 1 ]]; then
+              echo "::error::Multiple ZIP files found. Specify the archive input."
+              printf ' - %s\n' "${zip_files[@]}"
+              exit 1
+            fi
+
+            archive="${zip_files[0]}"
+          fi
+
+          archive="$(realpath "$archive")"
+
+          echo "Using archive: $archive"
+
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "$tmp_dir"' EXIT
+
+          echo "Extracting ZIP..."
+          unzip -q "$archive" -d "$tmp_dir"
+
+          # Detect Flutter project root.
+          # Supports:
+          #   project/pubspec.yaml
+          #   pubspec.yaml directly at ZIP root
+          mapfile -t pubspecs < <(
+            find "$tmp_dir" \
+              -type f \
+              -name 'pubspec.yaml' \
+              -print
+          )
+
+          if [[ ${#pubspecs[@]} -eq 0 ]]; then
+            echo "::error::No pubspec.yaml found inside ZIP."
+            exit 1
+          fi
+
+          if [[ ${#pubspecs[@]} -gt 1 ]]; then
+            echo "::error::Multiple pubspec.yaml files found inside ZIP:"
+            printf ' - %s\n' "${pubspecs[@]}"
+            exit 1
+          fi
+
+          project_dir="$(dirname "${pubspecs[0]}")"
+
+          echo "Detected Flutter project root: $project_dir"
+
+          # Merge the extracted project into the checked-out repository.
+          # Keep the Git metadata of the checked-out repository intact.
+          rsync -a \
+            --exclude='.git/' \
+            "$project_dir/" \
+            "$GITHUB_WORKSPACE/"
+
+          echo "Repository after extraction:"
+          ls -la
+
+          test -f "$GITHUB_WORKSPACE/pubspec.yaml"
 
       - name: Generate or validate pubspec.lock
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+
+          cd "$GITHUB_WORKSPACE"
+
           test -f pubspec.yaml
-          if [ -f pubspec.lock ]; then
+
+          if [[ -f pubspec.lock ]]; then
+            echo "pubspec.lock exists; validating locked dependencies."
             flutter pub get --enforce-lockfile
           else
-            echo 'pubspec.lock missing; resolving dependencies once and committing the generated lockfile.'
+            echo "pubspec.lock missing; resolving dependencies once."
             flutter pub get
             test -s pubspec.lock
           fi
@@ -65,23 +158,55 @@ jobs:
       - name: Validate repository bootstrap
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+
+          cd "$GITHUB_WORKSPACE"
+
           test -f pubspec.yaml
           test -d lib
           test -d android
+
+          if [[ ! -x android/gradlew ]]; then
+            echo "::warning::android/gradlew is not executable; fixing permission."
+            chmod +x android/gradlew
+          fi
+
           test -x android/gradlew
           test -s pubspec.lock
+
           test -f .github/workflows/zip-build-and-report.yml
-          ! find . -type f \( -name '*.apk' -o -name '*.aab' \) -print -quit | grep -q .
+
+          if find . \
+            -type f \
+            \( -name '*.apk' -o -name '*.aab' \) \
+            -print -quit | grep -q .; then
+            echo "::error::Generated APK/AAB must not be committed during bootstrap."
+            exit 1
+          fi
+
+      - name: Remove source ZIPs from repository
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          cd "$GITHUB_WORKSPACE"
+
+          git rm -f --ignore-unmatch -- \
+            '*.zip' \
+            '*.ZIP' || true
 
       - name: Commit extracted project and lockfile
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+
+          cd "$GITHUB_WORKSPACE"
+
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
           git add -A
-          git rm -f --ignore-unmatch -- '*.zip' '*.ZIP' || true
+
           if git diff --cached --quiet; then
             echo 'No repository changes to commit.'
           else
